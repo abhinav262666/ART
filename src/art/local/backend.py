@@ -3,6 +3,7 @@ import json
 import math
 import os
 import subprocess
+import warnings
 from datetime import datetime
 from types import TracebackType
 from typing import AsyncIterator, Literal, cast
@@ -22,9 +23,11 @@ from typing_extensions import Self
 from wandb.sdk.wandb_run import Run
 from weave.trace.weave_client import WeaveClient
 
-from art.utils.deploy_model import (
-    LoRADeploymentJob,
-    LoRADeploymentProvider,
+from art.utils.deployment import (
+    DeploymentResult,
+    Provider,
+    TogetherDeploymentConfig,
+    WandbDeploymentConfig,
     deploy_model,
 )
 from art.utils.old_benchmarking.calculate_step_metrics import calculate_step_std_dev
@@ -675,6 +678,146 @@ class LocalBackend(Backend):
     # Experimental support for S3
     # ------------------------------------------------------------------
 
+    async def _experimental_pull_model_checkpoint(
+        self,
+        model: "TrainableModel",
+        *,
+        step: int | Literal["latest"] | None = None,
+        local_path: str | None = None,
+        s3_bucket: str | None = None,
+        prefix: str | None = None,
+        verbose: bool = False,
+    ) -> str:
+        """Pull a model checkpoint to a local path.
+
+        For LocalBackend, this:
+        1. When step is "latest" or None, checks both local storage and S3 (if provided)
+           to find the latest checkpoint, preferring local if steps are equal
+        2. If checkpoint exists locally, uses it (optionally copying to local_path)
+        3. If checkpoint doesn't exist locally but s3_bucket is provided, pulls from S3
+        4. Returns the final checkpoint path
+
+        Args:
+            model: The model to pull checkpoint for.
+            step: The step to pull. Can be an int for a specific step,
+                 or "latest" to pull the latest checkpoint. If None, pulls latest.
+            local_path: Custom directory to save/copy the checkpoint to.
+                       If None, returns checkpoint from backend's default art path.
+            s3_bucket: S3 bucket to check/pull from. When step is "latest", both
+                       local storage and S3 are checked to find the true latest.
+            prefix: S3 prefix.
+            verbose: Whether to print verbose output.
+
+        Returns:
+            Path to the local checkpoint directory.
+        """
+        # Determine which step to use
+        resolved_step: int
+        if step is None or step == "latest":
+            # Check both local storage and S3 (if provided) for the latest checkpoint
+            local_latest_step: int | None = None
+            s3_latest_step: int | None = None
+
+            # Get latest from local storage
+            try:
+                local_latest_step = get_model_step(model, self._path)
+                if local_latest_step == 0:
+                    # get_model_step returns 0 if no checkpoints exist
+                    local_latest_step = None
+            except Exception:
+                local_latest_step = None
+
+            # Get latest from S3 if bucket provided
+            if s3_bucket is not None:
+                from art.utils.s3_checkpoint_utils import (
+                    get_latest_checkpoint_step_from_s3,
+                )
+
+                s3_latest_step = await get_latest_checkpoint_step_from_s3(
+                    model_name=model.name,
+                    project=model.project,
+                    s3_bucket=s3_bucket,
+                    prefix=prefix,
+                )
+
+            # Determine which source has the latest checkpoint
+            if local_latest_step is None and s3_latest_step is None:
+                raise ValueError(
+                    f"No checkpoints found for {model.project}/{model.name} in local storage or S3"
+                )
+            elif local_latest_step is None:
+                resolved_step = s3_latest_step  # type: ignore[assignment]
+                if verbose:
+                    print(f"Using latest checkpoint from S3: step {resolved_step}")
+            elif s3_latest_step is None:
+                resolved_step = local_latest_step
+                if verbose:
+                    print(
+                        f"Using latest checkpoint from local storage: step {resolved_step}"
+                    )
+            elif local_latest_step >= s3_latest_step:
+                # Prefer local if equal or greater
+                resolved_step = local_latest_step
+                if verbose:
+                    print(
+                        f"Using latest checkpoint from local storage: step {resolved_step} "
+                    )
+            else:
+                resolved_step = s3_latest_step
+                if verbose:
+                    print(f"Using latest checkpoint from S3: step {resolved_step} ")
+        else:
+            resolved_step = step
+
+        # Check if checkpoint exists in the original training location
+        original_checkpoint_dir = get_step_checkpoint_dir(
+            get_model_dir(model=model, art_path=self._path), resolved_step
+        )
+
+        # Step 1: Ensure checkpoint exists at original_checkpoint_dir
+        if not os.path.exists(original_checkpoint_dir):
+            if s3_bucket is None:
+                raise FileNotFoundError(
+                    f"Checkpoint not found at {original_checkpoint_dir} and no S3 bucket specified"
+                )
+            if verbose:
+                print(f"Pulling checkpoint step {resolved_step} from S3...")
+            await pull_model_from_s3(
+                model_name=model.name,
+                project=model.project,
+                step=resolved_step,
+                s3_bucket=s3_bucket,
+                prefix=prefix,
+                verbose=verbose,
+                art_path=self._path,
+                exclude=["logs", "trajectories"],
+            )
+            # Validate that the checkpoint was actually downloaded
+            if not os.path.exists(original_checkpoint_dir) or not os.listdir(
+                original_checkpoint_dir
+            ):
+                raise FileNotFoundError(f"Checkpoint step {resolved_step} not found")
+
+        # Step 2: Handle local_path if provided
+        if local_path is not None:
+            if verbose:
+                print(
+                    f"Copying checkpoint from {original_checkpoint_dir} to {local_path}..."
+                )
+            import shutil
+
+            os.makedirs(local_path, exist_ok=True)
+            shutil.copytree(original_checkpoint_dir, local_path, dirs_exist_ok=True)
+            if verbose:
+                print(f"✓ Checkpoint copied successfully")
+            return local_path
+
+        if verbose:
+            print(
+                f"Checkpoint step {resolved_step} exists at {original_checkpoint_dir}"
+            )
+        return original_checkpoint_dir
+
     async def _experimental_pull_from_s3(
         self,
         model: Model,
@@ -690,6 +833,10 @@ class LocalBackend(Backend):
         latest_only: bool = False,
     ) -> None:
         """Download the model directory from S3 into local Backend storage. Right now this can be used to pull trajectory logs for processing or model checkpoints.
+
+        .. deprecated::
+            This method is deprecated. Use `_experimental_pull_model_checkpoint` instead.
+
         Args:
             model: The model to pull from S3.
             step: DEPRECATED. Use only_step instead.
@@ -702,6 +849,11 @@ class LocalBackend(Backend):
             only_step: If specified, only pull this specific step. Can be an int for a specific step,
                       or "latest" to pull only the latest checkpoint. If None, pulls all steps.
         """
+        warnings.warn(
+            "_experimental_pull_from_s3 is deprecated. Use _experimental_pull_model_checkpoint instead.",
+            DeprecationWarning,
+            stacklevel=2,
+        )
 
         # Handle backward compatibility and new only_step parameter
         if only_step is None and latest_only:
@@ -941,32 +1093,3 @@ class LocalBackend(Backend):
             print(
                 f"Successfully forked checkpoint from {from_model} (step {selected_step}) to {model.name}"
             )
-
-    async def _experimental_deploy(
-        self,
-        deploy_to: LoRADeploymentProvider,
-        model: "TrainableModel",
-        step: int | None = None,
-        s3_bucket: str | None = None,
-        prefix: str | None = None,
-        verbose: bool = False,
-        pull_s3: bool = True,
-        wait_for_completion: bool = True,
-    ) -> LoRADeploymentJob:
-        """
-        Deploy the model's latest checkpoint to a hosted inference endpoint.
-
-        Together is currently the only supported provider. See link for supported base models:
-        https://docs.together.ai/docs/lora-inference#supported-base-models
-        """
-        return await deploy_model(
-            deploy_to=deploy_to,
-            model=model,
-            step=step,
-            s3_bucket=s3_bucket,
-            prefix=prefix,
-            verbose=verbose,
-            pull_s3=pull_s3,
-            wait_for_completion=wait_for_completion,
-            art_path=self._path,
-        )
